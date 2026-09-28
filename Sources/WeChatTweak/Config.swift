@@ -27,11 +27,13 @@ struct Config: Decodable {
         let arch: Arch
         let addr: UInt64
         let asm: Data
+        let expected: [Data]?
 
         private enum CodingKeys: CodingKey {
             case arch
             case addr
             case asm
+            case expected
         }
 
         init(from decoder: any Decoder) throws {
@@ -59,27 +61,60 @@ struct Config: Decodable {
                 }
                 return value
             }()
+            guard !asm.isEmpty else {
+                throw DecodingError.dataCorruptedError(forKey: .asm, in: container, debugDescription: "Empty patch")
+            }
+            if container.contains(.expected) {
+                let values: [String]
+                let replacementLength = asm.count
+                if let value = try? container.decode(String.self, forKey: .expected) {
+                    values = [value]
+                } else {
+                    values = try container.decode([String].self, forKey: .expected)
+                }
+                let bytes = values.compactMap(Data.init(hex:))
+                guard !values.isEmpty, bytes.count == values.count,
+                      bytes.allSatisfy({ $0.count == replacementLength }) else {
+                    throw DecodingError.dataCorruptedError(forKey: .expected, in: container, debugDescription: "Every expected byte pattern must match patch length")
+                }
+                self.expected = bytes
+            } else {
+                self.expected = nil
+            }
         }
     }
 
     struct Target: Decodable {
         let identifier: String
+        let binary: String
         let entries: [Entry]
 
         private enum CodingKeys: CodingKey {
             case identifier
+            case binary
             case entries
         }
 
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.identifier = try container.decode(String.self, forKey: .identifier)
+            self.binary = try container.decodeIfPresent(String.self, forKey: .binary) ?? "Contents/MacOS/WeChat"
+            guard !binary.hasPrefix("/"), !binary.split(separator: "/").contains(".."), binary.hasPrefix("Contents/") else {
+                throw DecodingError.dataCorruptedError(forKey: .binary, in: container, debugDescription: "Binary must be inside the app's Contents directory")
+            }
             self.entries = try container.decode([Entry].self, forKey: .entries)
         }
     }
 
     let version: String
     let targets: [Target]
+
+    func targets(showRecallNotice: Bool) -> [Target]? {
+        let recallNoticeTargets = targets.filter { $0.identifier == "revoke-keeptip" }
+        guard !showRecallNotice || !recallNoticeTargets.isEmpty else { return nil }
+        let otherTargets = targets.filter { $0.identifier != "revoke" && $0.identifier != "revoke-keeptip" }
+        return showRecallNotice ? otherTargets + recallNoticeTargets : targets.filter { $0.identifier != "revoke-keeptip" }
+    }
 
     static func load(url: URL) async throws -> [Config] {
         if url.isFileURL {

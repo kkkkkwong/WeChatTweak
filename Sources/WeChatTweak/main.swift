@@ -34,6 +34,12 @@ extension Tweak {
         @OptionGroup
         var options: Tweak.Options
 
+        @Flag(help: "Validate all patch locations without modifying or signing the app")
+        var dryRun = false
+
+        @Flag(help: "Keep recalled messages and show WeChat's recall notice")
+        var showRecallNotice = false
+
         mutating func run() async throws {
             print("------ Version ------")
             let version = try await Command.version(app: options.app)
@@ -46,15 +52,22 @@ extension Tweak {
             print("Matched config: \(config)")
 
             print("------ Patch ------")
-            try await Command.patch(
+            let binaries = try await Command.patch(
                 app: options.app,
-                config: config
+                config: config,
+                dryRun: dryRun,
+                showRecallNotice: showRecallNotice
             )
+            if dryRun {
+                print("Validation passed. No files were modified.")
+                Darwin.exit(EXIT_SUCCESS)
+            }
             print("Done!")
 
             print("------ Resign ------")
             try await Command.resign(
-                app: options.app
+                app: options.app,
+                binaries: binaries
             )
             print("Done!")
 

@@ -1,161 +1,161 @@
 //
 //  Patcher.swift
-//  WeChatTweak
 //
 //  Created by Sunny Young on 2025/12/4.
 //
 
-import Darwin
-import MachO
 import Foundation
+import MachO
 
 struct Patcher {
-    enum Error: Swift.Error {
+    enum Error: LocalizedError {
         case invalidFile
-        case not64BitMachO(magic: UInt32)
-        case vaNotFound(arch: String, va: UInt64)
         case noArchMatched
+        case vaNotFound(arch: String, va: UInt64)
+        case unexpectedBytes(arch: String, va: UInt64)
+        case overlappingPatches
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidFile: return "Invalid or truncated Mach-O file"
+            case .noArchMatched: return "The binary does not contain every configured architecture"
+            case let .vaNotFound(arch, va): return "Patch address is not file-backed: \(arch) 0x\(String(va, radix: 16))"
+            case let .unexpectedBytes(arch, va): return "Unexpected bytes at \(arch) 0x\(String(va, radix: 16)); refusing to patch"
+            case .overlappingPatches: return "Overlapping patch locations"
+            }
+        }
     }
 
-    static func patch(binary: URL, config: Config) throws {
-        guard FileManager.default.fileExists(atPath: binary.path) else {
-            throw Error.invalidFile
-        }
+    struct Write {
+        let offset: UInt64
+        let original: Data
+        let replacement: Data
+    }
 
-        let entries = config.targets.flatMap { $0.entries }
+    struct Plan {
+        let binary: URL
+        let writes: [Write]
+    }
+
+    private struct Slice {
+        let cpu: UInt32
+        let offset: Int
+        let size: Int
+    }
+
+    // Resolve and validate every write before opening any file for modification.
+    static func prepare(binary: URL, entries: [Config.Entry]) throws -> Plan {
+        let data = try Data(contentsOf: binary, options: .mappedIfSafe)
         guard !entries.isEmpty else { throw Error.noArchMatched }
-
-        let fh = try FileHandle(forUpdating: binary)
-        defer { try? fh.close() }
-
-        // 读 magic 判断 fat / thin
-        guard let magicData = try fh.read(upToCount: 4), magicData.count == 4 else {
-            throw Error.invalidFile
-        }
-        let magicBE = magicData.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
-        let isSwappedFat = (magicBE == FAT_CIGAM)
-
-        var patchedCount = 0
-        if magicBE == FAT_MAGIC || magicBE == FAT_CIGAM {
-            // FAT header: magic(4) + nfat_arch(4)
-            guard let nfatData = try fh.read(upToCount: 4), nfatData.count == 4 else {
-                throw Error.invalidFile
-            }
-            let rawNfat = nfatData.withUnsafeBytes { $0.load(as: UInt32.self) }
-            let nfat = isSwappedFat ? UInt32(littleEndian: rawNfat) : UInt32(bigEndian: rawNfat)
-
-            // 先读完 fat_arch 表，避免 patch 时移动文件指针影响后续读取
-            var archEntries: [(cputype: UInt32, offset: UInt32)] = []
-
-            for _ in 0..<nfat {
-                // fat_arch: cputype(4) cpusub(4) offset(4) size(4) align(4) big-endian
-                guard let archData = try fh.read(upToCount: 20), archData.count == 20 else {
-                    throw Error.invalidFile
-                }
-                let rawCpu = archData.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self) }
-                let rawOff = archData.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt32.self) }
-                let cputype = isSwappedFat ? UInt32(littleEndian: rawCpu) : UInt32(bigEndian: rawCpu)
-                let offset  = isSwappedFat ? UInt32(littleEndian: rawOff) : UInt32(bigEndian: rawOff)
-                archEntries.append((cputype, offset))
-            }
-
-            for entry in archEntries {
-                let matching = entries.filter { $0.arch.cpu == entry.cputype }
-                for target in matching {
-                    try patchOneSlice(file: fh,
-                                      sliceOffset: UInt64(entry.offset),
-                                      targetVA: target.addr,
-                                      patch: target.asm,
-                                      archName: target.arch.rawValue)
-                    patchedCount += 1
-                }
-            }
-        } else {
-            // thin mach-o：回到开头按 mach_header_64 解析（小端）
-            try fh.seek(toOffset: 0)
-            guard let hdr = try fh.read(upToCount: 32), hdr.count == 32 else {
-                throw Error.invalidFile
-            }
-            let magic = hdr.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-            let cputype = hdr.withUnsafeBytes { $0.load(fromByteOffset: 4, as: Int32.self).littleEndian }
-
-            guard magic == MH_MAGIC_64 else {
-                throw Error.not64BitMachO(magic: magic)
-            }
-
-            let matching = entries.filter { Int32(bitPattern: $0.arch.cpu) == cputype }
-            if matching.isEmpty {
+        let slices = try slices(in: data)
+        var writes: [Write] = []
+        for entry in entries {
+            guard let slice = slices.first(where: { $0.cpu == entry.arch.cpu }) else {
                 throw Error.noArchMatched
             }
-
-            for target in matching {
-                try patchOneSlice(file: fh,
-                                  sliceOffset: 0,
-                                  targetVA: target.addr,
-                                  patch: target.asm,
-                                  archName: target.arch.rawValue)
-                patchedCount += 1
+            let offset = try fileOffset(in: data, slice: slice, entry: entry)
+            let original = data.subdata(in: offset..<(offset + entry.asm.count))
+            if let expected = entry.expected, !expected.contains(original) && original != entry.asm {
+                throw Error.unexpectedBytes(arch: entry.arch.rawValue, va: entry.addr)
+            }
+            print("[\(entry.arch.rawValue)] \(binary.lastPathComponent): VA=0x\(String(entry.addr, radix: 16)), offset=0x\(String(offset, radix: 16))\(original == entry.asm ? " (already patched)" : "")")
+            writes.append(Write(offset: UInt64(offset), original: original, replacement: entry.asm))
+        }
+        let sorted = writes.sorted { $0.offset < $1.offset }
+        for (previous, next) in zip(sorted, sorted.dropFirst()) {
+            guard previous.offset + UInt64(previous.replacement.count) <= next.offset else {
+                throw Error.overlappingPatches
             }
         }
-
-        if patchedCount <= 0 {
-            throw Error.noArchMatched
-        }
+        return Plan(binary: binary, writes: writes)
     }
 
-    private static func patchOneSlice(file fh: FileHandle,
-                                      sliceOffset: UInt64,
-                                      targetVA: UInt64,
-                                      patch: Data,
-                                      archName: String) throws {
-
-        // 读 slice 内 mach_header_64
-        try fh.seek(toOffset: sliceOffset)
-        guard let hdr = try fh.read(upToCount: 32), hdr.count == 32 else {
-            throw Error.invalidFile
-        }
-
-        let magic   = hdr.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-        let ncmds   = hdr.withUnsafeBytes { $0.load(fromByteOffset: 16, as: UInt32.self).littleEndian }
-
-        guard magic == MH_MAGIC_64 else {
-            throw Error.not64BitMachO(magic: magic)
-        }
-
-        var lcOffset = sliceOffset + 32
-
-        for _ in 0..<ncmds {
-            try fh.seek(toOffset: lcOffset)
-            guard let lcHead = try fh.read(upToCount: 8), lcHead.count == 8 else {
+    static func apply(_ plan: Plan) throws {
+        let file = try FileHandle(forUpdating: plan.binary)
+        defer { try? file.close() }
+        // Reject files changed after preflight, before performing this plan's writes.
+        for write in plan.writes {
+            try file.seek(toOffset: write.offset)
+            guard try file.read(upToCount: write.original.count) == write.original else {
                 throw Error.invalidFile
             }
+        }
+        for write in plan.writes where write.original != write.replacement {
+            try file.seek(toOffset: write.offset)
+            try file.write(contentsOf: write.replacement)
+        }
+        try file.synchronize()
+    }
 
-            let cmd     = lcHead.withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-            let cmdsize = lcHead.withUnsafeBytes { $0.load(fromByteOffset: 4, as: UInt32.self).littleEndian }
-
-            if cmd == LC_SEGMENT_64 {
-                guard let segData = try fh.read(upToCount: 64), segData.count == 64 else {
+    private static func slices(in data: Data) throws -> [Slice] {
+        let magic = try uint32(data, at: 0, bigEndian: true)
+        if magic == FAT_MAGIC || magic == FAT_CIGAM {
+            let bigEndian = magic == FAT_MAGIC
+            let count = Int(try uint32(data, at: 4, bigEndian: bigEndian))
+            guard data.count >= 8, count <= (data.count - 8) / 20 else { throw Error.invalidFile }
+            return try (0..<count).map { index in
+                let base = 8 + index * 20
+                let cpu = try uint32(data, at: base, bigEndian: bigEndian)
+                let offset = Int(try uint32(data, at: base + 8, bigEndian: bigEndian))
+                let size = Int(try uint32(data, at: base + 12, bigEndian: bigEndian))
+                guard offset >= 8 + count * 20, size >= 32, offset <= data.count, size <= data.count - offset else {
                     throw Error.invalidFile
                 }
+                return Slice(cpu: cpu, offset: offset, size: size)
+            }
+        }
+        guard try uint32(data, at: 0) == MH_MAGIC_64 else { throw Error.invalidFile }
+        return [Slice(cpu: try uint32(data, at: 4), offset: 0, size: data.count)]
+    }
 
-                let vmaddr  = segData.withUnsafeBytes { $0.load(fromByteOffset: 16, as: UInt64.self).littleEndian }
-                let vmsize  = segData.withUnsafeBytes { $0.load(fromByteOffset: 24, as: UInt64.self).littleEndian }
-                let fileoff = segData.withUnsafeBytes { $0.load(fromByteOffset: 32, as: UInt64.self).littleEndian }
-
-                if vmaddr <= targetVA && targetVA < vmaddr + vmsize {
-                    let fileOffset = sliceOffset + fileoff + (targetVA - vmaddr)
-                    print("[\(archName)] vmaddr=\(String(format: "0x%llx", vmaddr)), fileoff=\(String(format: "0x%llx", fileoff)), sliceoff=\(String(format: "0x%llx", sliceOffset))")
-                    print("[\(archName)] patch VA=\(String(format: "0x%llx", targetVA)), fileoff=\(String(format: "0x%llx", fileOffset))")
-
-                    try fh.seek(toOffset: fileOffset)
-                    try fh.write(contentsOf: patch)
-                    return
+    private static func fileOffset(in data: Data, slice: Slice, entry: Config.Entry) throws -> Int {
+        let base = slice.offset
+        guard slice.size >= 32,
+              try uint32(data, at: base) == MH_MAGIC_64,
+              try uint32(data, at: base + 4) == slice.cpu else { throw Error.invalidFile }
+        let count = Int(try uint32(data, at: base + 16))
+        let commandSize = Int(try uint32(data, at: base + 20))
+        guard commandSize <= slice.size - 32, count <= commandSize / 8 else { throw Error.invalidFile }
+        let commandEnd = base + 32 + commandSize
+        var cursor = base + 32
+        var result: Int?
+        for _ in 0..<count {
+            guard cursor <= commandEnd - 8 else { throw Error.invalidFile }
+            let command = try uint32(data, at: cursor)
+            let size = Int(try uint32(data, at: cursor + 4))
+            guard size >= 8, size <= commandEnd - cursor else { throw Error.invalidFile }
+            if command == LC_SEGMENT_64 {
+                guard size >= 72 else { throw Error.invalidFile }
+                let vmaddr = try uint64(data, at: cursor + 24)
+                let vmsize = try uint64(data, at: cursor + 32)
+                let fileoff = try uint64(data, at: cursor + 40)
+                let filesize = try uint64(data, at: cursor + 48)
+                let length = UInt64(entry.asm.count)
+                guard fileoff <= UInt64(slice.size), filesize <= UInt64(slice.size) - fileoff else {
+                    throw Error.invalidFile
+                }
+                if entry.addr >= vmaddr {
+                    let delta = entry.addr - vmaddr
+                    if delta < vmsize, delta <= filesize, length <= filesize - delta, length <= vmsize - delta {
+                        guard result == nil else { throw Error.invalidFile }
+                        result = base + Int(fileoff + delta)
+                    }
                 }
             }
-
-            lcOffset += UInt64(cmdsize)
+            cursor += size
         }
+        guard let result else { throw Error.vaNotFound(arch: entry.arch.rawValue, va: entry.addr) }
+        return result
+    }
 
-        throw Error.vaNotFound(arch: archName, va: targetVA)
+    private static func uint32(_ data: Data, at offset: Int, bigEndian: Bool = false) throws -> UInt32 {
+        guard offset >= 0, offset <= data.count, 4 <= data.count - offset else { throw Error.invalidFile }
+        let value = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
+        return bigEndian ? UInt32(bigEndian: value) : UInt32(littleEndian: value)
+    }
+
+    private static func uint64(_ data: Data, at offset: Int) throws -> UInt64 {
+        guard offset >= 0, offset <= data.count, 8 <= data.count - offset else { throw Error.invalidFile }
+        return UInt64(littleEndian: data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) })
     }
 }
