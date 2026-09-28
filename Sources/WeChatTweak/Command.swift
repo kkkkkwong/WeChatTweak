@@ -11,7 +11,8 @@ struct Command {
         case executing(command: String, status: Int32, output: String)
         case invalidBinaryPath(String)
         case unsupportedArchitecture
-        case unsupportedRecallNotice
+        case unsupportedRecallMode
+        case missingRuntimeDylib(String)
 
         var errorDescription: String? {
             switch self {
@@ -21,8 +22,10 @@ struct Command {
                 return "Binary path escapes the app bundle: \(path)"
             case .unsupportedArchitecture:
                 return "This configuration does not support the current CPU architecture"
-            case .unsupportedRecallNotice:
-                return "This WeChat build has no verified recall-notice patch"
+            case .unsupportedRecallMode:
+                return "This WeChat build has no verified patch for the selected recall-label mode"
+            case let .missingRuntimeDylib(path):
+                return "Custom recall labels need the runtime library at \(path); build it with `swift build --product WeChatTweakRuntime` or pass --runtime-dylib"
             }
         }
     }
@@ -38,10 +41,12 @@ struct Command {
         app: URL,
         config: Config,
         dryRun: Bool = false,
-        showRecallNotice: Bool = false
+        showRecallNotice: Bool = false,
+        customRecallLabel: Bool = false,
+        runtimeDylib: URL? = nil
     ) async throws -> [URL] {
-        guard let targets = config.targets(showRecallNotice: showRecallNotice) else {
-            throw Error.unsupportedRecallNotice
+        guard let targets = config.targets(showRecallNotice: showRecallNotice, customRecallLabel: customRecallLabel) else {
+            throw Error.unsupportedRecallMode
         }
         #if arch(arm64)
         let architecture = Config.Arch.arm64
@@ -61,12 +66,38 @@ struct Command {
             }
             return try Patcher.prepare(binary: binary, entries: groups[path]!.flatMap(\.entries))
         }
+        var runtimePlan: DylibInjector.Plan?
+        var runtimeSource: URL?
+        var runtimeDestination: URL?
+        if customRecallLabel {
+            let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+            let source = runtimeDylib ?? executable
+                .deletingLastPathComponent()
+                .appendingPathComponent("libWeChatTweakRuntime.dylib")
+            guard FileManager.default.isReadableFile(atPath: source.path) else {
+                throw Error.missingRuntimeDylib(source.path)
+            }
+            let binary = root.appendingPathComponent("Contents/Resources/wechat.dylib")
+            runtimePlan = try DylibInjector.prepare(
+                binary: binary,
+                installName: "@loader_path/libWeChatTweakRuntime.dylib"
+            )
+            runtimeSource = source
+            runtimeDestination = root.appendingPathComponent("Contents/Resources/libWeChatTweakRuntime.dylib")
+        }
         if !dryRun {
+            if let runtimeSource, let runtimeDestination {
+                if FileManager.default.fileExists(atPath: runtimeDestination.path) {
+                    try FileManager.default.removeItem(at: runtimeDestination)
+                }
+                try FileManager.default.copyItem(at: runtimeSource, to: runtimeDestination)
+            }
             for plan in plans {
                 try Patcher.apply(plan)
             }
+            if let runtimePlan { try DylibInjector.apply(runtimePlan) }
         }
-        return plans.map(\.binary)
+        return plans.map(\.binary) + (runtimeDestination.map { [$0] } ?? [])
     }
 
     static func resign(app: URL, binaries: [URL]) async throws {

@@ -109,11 +109,15 @@ struct Config: Decodable {
     let version: String
     let targets: [Target]
 
-    func targets(showRecallNotice: Bool) -> [Target]? {
+    func targets(showRecallNotice: Bool, customRecallLabel: Bool = false) -> [Target]? {
         let recallNoticeTargets = targets.filter { $0.identifier == "revoke-keeptip" }
+        let customTargets = targets.filter { $0.identifier == "runtime-tip" }
+        guard !(showRecallNotice && customRecallLabel) else { return nil }
         guard !showRecallNotice || !recallNoticeTargets.isEmpty else { return nil }
-        let otherTargets = targets.filter { $0.identifier != "revoke" && $0.identifier != "revoke-keeptip" }
-        return showRecallNotice ? otherTargets + recallNoticeTargets : targets.filter { $0.identifier != "revoke-keeptip" }
+        guard !customRecallLabel || (!recallNoticeTargets.isEmpty && !customTargets.isEmpty) else { return nil }
+        let otherTargets = targets.filter { !["revoke", "revoke-keeptip", "runtime-tip"].contains($0.identifier) }
+        if customRecallLabel { return otherTargets + recallNoticeTargets + customTargets }
+        return showRecallNotice ? otherTargets + recallNoticeTargets : targets.filter { $0.identifier != "revoke-keeptip" && $0.identifier != "runtime-tip" }
     }
 
     static func load(url: URL) async throws -> [Config] {

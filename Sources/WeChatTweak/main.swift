@@ -40,6 +40,12 @@ extension Tweak {
         @Flag(help: "Keep recalled messages and show WeChat's recall notice")
         var showRecallNotice = false
 
+        @Flag(help: "Keep recalled messages and show a custom recall label")
+        var customRecallLabel = false
+
+        @Option(name: .long, help: "Path to libWeChatTweakRuntime.dylib (defaults to the CLI's directory)")
+        var runtimeDylib: String?
+
         mutating func run() async throws {
             print("------ Version ------")
             let version = try await Command.version(app: options.app)
@@ -56,7 +62,9 @@ extension Tweak {
                 app: options.app,
                 config: config,
                 dryRun: dryRun,
-                showRecallNotice: showRecallNotice
+                showRecallNotice: showRecallNotice,
+                customRecallLabel: customRecallLabel,
+                runtimeDylib: runtimeDylib.map { URL(fileURLWithPath: $0) }
             )
             if dryRun {
                 print("Validation passed. No files were modified.")
