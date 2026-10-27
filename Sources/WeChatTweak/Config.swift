@@ -116,7 +116,9 @@ struct Config: Decodable {
         guard !showRecallNotice || !recallNoticeTargets.isEmpty else { return nil }
         guard !customRecallLabel || (!recallNoticeTargets.isEmpty && !customTargets.isEmpty) else { return nil }
         let otherTargets = targets.filter { !["revoke", "revoke-keeptip", "runtime-tip"].contains($0.identifier) }
-        if customRecallLabel { return otherTargets + recallNoticeTargets + customTargets }
+        if customRecallLabel {
+            return otherTargets.filter { $0.identifier != "runtime-tip-reset" } + recallNoticeTargets + customTargets
+        }
         return showRecallNotice ? otherTargets + recallNoticeTargets : targets.filter { $0.identifier != "revoke-keeptip" && $0.identifier != "runtime-tip" }
     }
 

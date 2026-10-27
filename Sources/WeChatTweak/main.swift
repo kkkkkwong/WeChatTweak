@@ -85,6 +85,83 @@ extension Tweak {
 
 }
 
+// MARK: Runtime Injection
+extension Tweak {
+    struct InjectRuntime: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "inject-runtime",
+            abstract: "Inject the arm64 runtime and menu marker independently of patch profiles"
+        )
+
+        @Option(name: .shortAndLong, help: "Path of WeChat.app")
+        var app = "/Applications/WeChat.app"
+
+        @Option(name: .long, help: "Path to libWeChatTweakRuntime.dylib (defaults to the CLI's directory)")
+        var runtimeDylib: String?
+
+        @Flag(help: "Validate runtime injection without modifying or signing the app")
+        var dryRun = false
+
+        mutating func run() async throws {
+            let appURL = URL(fileURLWithPath: app)
+            let binaries = try Command.injectRuntime(
+                app: appURL,
+                runtimeDylib: runtimeDylib.map { URL(fileURLWithPath: $0) },
+                dryRun: dryRun
+            )
+            if dryRun {
+                print("Validation passed. No files were modified.")
+            } else {
+                try await Command.resign(app: appURL, binaries: binaries)
+                print("Runtime injected. Fully quit and reopen WeChat to see WeChatTweak ✓.")
+                print("Revoke-hook compatibility is shown separately in the menu.")
+            }
+            Darwin.exit(EXIT_SUCCESS)
+        }
+    }
+}
+
+// MARK: Updates
+extension Tweak {
+    struct Updates: ParsableCommand {
+        static let configuration = CommandConfiguration(abstract: "Inspect or lock a single WeChat app against replacement")
+
+        @Option(name: .shortAndLong, help: "Path of the WeChat.app to protect")
+        var app = "/Applications/WeChat.app"
+
+        @Flag(help: "Lock this app's files against changes; unlock before updating or patching")
+        var lock = false
+
+        @Flag(help: "Allow changes again by clearing this app's Finder file locks")
+        var unlock = false
+
+        @Flag(help: "Validate the requested change without changing any file locks")
+        var dryRun = false
+
+        mutating func validate() throws {
+            guard !(lock && unlock) else { throw ValidationError("Choose either --lock or --unlock") }
+            guard !dryRun || lock || unlock else { throw ValidationError("Use --dry-run with --lock or --unlock") }
+        }
+
+        mutating func run() throws {
+            let plan = try UpdateLock.prepare(app: URL(fileURLWithPath: app))
+            print("WeChat app: \(plan.app.path)")
+            if lock || unlock {
+                try UpdateLock.apply(plan, locked: lock, dryRun: dryRun)
+                if dryRun {
+                    print("Validation passed. No file locks were changed.")
+                } else {
+                    print(lock ? "App files locked. Unlock before updating, patching, moving or deleting this app." : "App file locks cleared.")
+                }
+            }
+            let current = try UpdateLock.prepare(app: plan.app)
+            let state = current.lockedCount == 0 ? "unlocked" : current.lockedCount == current.items.count ? "locked" : "partially locked"
+            print("Update protection: \(state) (\(current.lockedCount)/\(current.items.count) files and directories)")
+            Darwin.exit(EXIT_SUCCESS)
+        }
+    }
+}
+
 // MARK: Tweak
 struct Tweak: AsyncParsableCommand {
     enum Error: LocalizedError {
@@ -142,7 +219,9 @@ struct Tweak: AsyncParsableCommand {
         abstract: "A command-line tool for tweaking WeChat.",
         subcommands: [
             Versions.self,
-            Patch.self
+            Patch.self,
+            InjectRuntime.self,
+            Updates.self
         ]
     )
 

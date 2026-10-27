@@ -50,14 +50,17 @@ struct Signing {
             let binary = binary.resolvingSymlinksInPath().standardizedFileURL
             if !executablePaths.contains(binary.path) { candidates.insert(binary) }
         }
-        // Inspect bare executables too: previous --deep signing may have retained
-        // developer entitlements on one of these helper processes.
+        // Include unentitled libraries and generic signed resources (270115 also
+        // signs JSON files through xattrs). Leaving an original signature can
+        // fail deep verification if its signing certificate is no longer trusted.
         if let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
             for case let url as URL in enumerator {
                 let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
                 guard values.isRegularFile == true, values.isSymbolicLink != true,
                       !executablePaths.contains(url.path) else { continue }
-                if let profile = try? entitlements(at: url), !profile.isEmpty {
+                if isMachO(at: url) {
+                    candidates.insert(url)
+                } else if (try? entitlements(at: url)) != nil {
                     candidates.insert(url)
                 }
             }
@@ -94,6 +97,15 @@ struct Signing {
         // Do not clear unrelated xattrs: some nested resources store signatures there.
         _ = try? Command.execute("/usr/bin/xattr", arguments: ["-dr", "com.apple.quarantine", root.path])
         try Command.execute("/usr/bin/codesign", arguments: ["--verify", "--deep", "--strict", root.path])
+    }
+
+    private static func isMachO(at url: URL) -> Bool {
+        guard let file = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? file.close() }
+        guard let bytes = try? file.read(upToCount: 4), bytes.count == 4 else { return false }
+        let magic = bytes.withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)) }
+        return [0xfeedface, 0xcefaedfe, 0xfeedfacf, 0xcffaedfe,
+                0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca].contains(magic)
     }
 
     private static func bundleContainers(in root: URL) throws -> [URL] {

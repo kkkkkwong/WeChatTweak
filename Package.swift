@@ -32,8 +32,8 @@ let package = Package(
         ),
         .target(
             name: "WeChatTweakRuntime",
-            cxxSettings: [.unsafeFlags(["-std=gnu++17"])],
-            linkerSettings: [.linkedFramework("Foundation")]
+            cxxSettings: [.unsafeFlags(["-std=gnu++17", "-fobjc-arc"])],
+            linkerSettings: [.linkedFramework("Foundation"), .linkedFramework("AppKit")]
         ),
         .testTarget(
             name: "WeChatTweakTests",

@@ -76,6 +76,55 @@ struct PatcherTests {
     }
 
     @Test
+    func switching270115ModesRestoresEntriesWithoutConflictingWrites() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let configurations = try JSONDecoder().decode([Config].self, from: Data(contentsOf: root.appendingPathComponent("config.json")))
+        let configuration = try #require(configurations.first { $0.version == "270115" })
+        let base: UInt64 = 0x4b57000
+        let length = 0x70000
+        var data = Data(repeating: 0, count: length)
+        data.replaceSubrange(0..<512, with: thin())
+        func put(_ value: UInt64, at offset: Int) {
+            var value = value.littleEndian
+            withUnsafeBytes(of: &value) { data.replaceSubrange(offset..<(offset + 8), with: $0) }
+        }
+        put(base, at: 56)
+        put(UInt64(length), at: 64)
+        put(UInt64(length), at: 80)
+        // Seed the independently inspected original parser/finalizer prologues,
+        // guard, and newmsgid store in a synthetic file-backed Mach-O segment.
+        let originals: [(UInt64, Data)] = [
+            (0x4bbaf6c, Data([0xf8, 0x5f, 0xbc, 0xa9, 0xf6, 0x57, 0x01, 0xa9, 0xf4, 0x4f, 0x02, 0xa9])),
+            (0x4b573b8, Data([0x08, 0x60, 0x49, 0x39, 0x1f, 0x05, 0x00, 0x71, 0x20, 0x08, 0x40, 0x7a])),
+            (0x4bbb1dc, Data([0x40, 0x10, 0x00, 0x34])),
+            (0x4bbb97c, Data([0x60, 0xe6, 0x00, 0xf9])),
+        ]
+        for (address, bytes) in originals {
+            let offset = Int(address - base)
+            data.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
+        }
+        try withBinary(data) { binary in
+            for mode in ["custom", "custom", "notice", "silent", "notice", "custom"] {
+                let targets = try #require(configuration.targets(showRecallNotice: mode == "notice", customRecallLabel: mode == "custom"))
+                let entries = targets.flatMap(\.entries)
+                try Patcher.apply(Patcher.prepare(binary: binary, entries: entries))
+                let patched = try Data(contentsOf: binary)
+                for entry in entries {
+                    let offset = Int(entry.addr - base)
+                    #expect(patched[offset..<(offset + entry.asm.count)] == entry.asm)
+                }
+                if mode != "custom" {
+                    for (address, bytes) in originals.prefix(2) {
+                        let offset = Int(address - base)
+                        #expect(patched[offset..<(offset + bytes.count)] == bytes)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     func testUniversalAndSwappedFatLeaveIntelSliceUnchanged() throws {
         for swapped in [false, true] {
             let data = fat([(0x01000007, thin(cpu: 0x01000007)), (0x0100000c, thin())], swapped: swapped)

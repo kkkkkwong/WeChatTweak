@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "WeChatAntiRecallRuntime.h"
+#include "InjectionMenu.h"
 
 namespace {
 
@@ -30,7 +31,7 @@ constexpr size_t revokeContentCacheMaximumCount = 512;
 constexpr size_t revokeContentPreviewMaximumBytes = 240;
 constexpr size_t arm64StubLength = 16;
 
-// Call-site analysis through build 270100 confirms this function takes exactly
+// Call-site analysis through build 270115 confirms this function takes exactly
 // three arguments. The second argument is the raw XML and the wrapper has already
 // copied it into the build-specific handlerOutput replaceMsg field.
 using ParseRevokeXML = bool (*)(void *, std::string *, void *);
@@ -68,7 +69,7 @@ struct InlineRevokeHookConfig {
 };
 
 // The revoke XML handler is selected only for message-extension types 71/72, so it
-// cannot observe ordinary text/media messages. Verified builds from 269340 through 270100 carry
+// cannot observe ordinary text/media messages. Verified builds from 269340 through 270115 carry
 // a second inline hook at the common Message finalizer. Call-path analysis shows every incoming
 // Message reaches this function after serverId/msgType/content have been populated
 // and immediately before its type-specific extension parser is dispatched.
@@ -245,6 +246,12 @@ constexpr InlineRevokeHookConfig inlineRevokeHookConfigs[] = {
     // guard and +0xA10 newmsgid store, with fields +0x1C8/+0x1D0. __DATA
     // slack after __common is only 0x58 bytes, so SLOT is 0xA367FF0.
     {"270100", 0x4bc4d34, {0xA9BC5FF8, 0xA90157F6, 0xA9024FF4}, 0x4bc4d40, 0x1c8, 0x1d0},
+    // 270115 (4.1.15.35, App Store): unique prologue/+0x270 guard/+0xA10
+    // newmsgid geometry at 0x4BBAF6C..0x4BBC088. Wrapper 0x4BBAD58 passes
+    // exactly three arguments and copies XML to replaceMsg +0x1D0. The
+    // newmsgid store independently decodes +0x1C8. SLOT 0xA347F00 is after
+    // __common end 0xA346DB8 and below __DATA end 0xA348000.
+    {"270115", 0x4bbaf6c, {0xA9BC5FF8, 0xA90157F6, 0xA9024FF4}, 0x4bbaf78, 0x1c8, 0x1d0},
 };
 
 constexpr InlineMessageCaptureHookConfig inlineMessageCaptureHookConfigs[] = {
@@ -426,6 +433,19 @@ constexpr InlineMessageCaptureHookConfig inlineMessageCaptureHookConfigs[] = {
         0x4b61808,
         {0x39496008, 0x7100051F, 0x7A400820},
         0x4b61814,
+        0x0f8,
+        0x00c,
+        0x130,
+    },
+    // 270115: constructor 0x4B5611C stores serverId +0xF8 at 0x4B56230,
+    // copies content +0x130 at 0x4B56254, and calls the type setter at
+    // 0x4B56320 before finalizing at 0x4B565D0. The finalizer prefix loads
+    // flag +0x258; the second reserved zero-fill SLOT is 0xA347F08.
+    {
+        "270115",
+        0x4b573b8,
+        {0x39496008, 0x7100051F, 0x7A400820},
+        0x4b573c4,
         0x0f8,
         0x00c,
         0x130,
@@ -2018,14 +2038,57 @@ void installMessageCaptureInlineHook(
     }
 }
 
+bool hasStaticRevokePatch(const WeChatDylibImage &image, const std::string &buildVersion) {
+    struct StaticPatchLocations {
+        const char *buildVersion;
+        uintptr_t guardOffset;
+        uintptr_t newMsgIdStoreOffset;
+    };
+    constexpr StaticPatchLocations locations[] = {
+        {"269602", 0x4941e44, 0x49425e4},
+        {"270115", 0x4bbb1dc, 0x4bbb97c},
+    };
+    for (const auto &location : locations) {
+        if (buildVersion != location.buildVersion) {
+            continue;
+        }
+        const uintptr_t guardAddress = image.slide + location.guardOffset;
+        const uintptr_t storeAddress = image.slide + location.newMsgIdStoreOffset;
+        if (!rangeContains(image.start, image.size, guardAddress, sizeof(uint32_t)) ||
+            !rangeContains(image.start, image.size, storeAddress, sizeof(uint32_t)) ||
+            !isAddressRangeReadable(reinterpret_cast<const void *>(guardAddress), sizeof(uint32_t)) ||
+            !isAddressRangeReadable(reinterpret_cast<const void *>(storeAddress), sizeof(uint32_t))) {
+            return false;
+        }
+        uint32_t guard = 0;
+        uint32_t store = 0;
+        std::memcpy(&guard, reinterpret_cast<const void *>(guardAddress), sizeof(guard));
+        std::memcpy(&store, reinterpret_cast<const void *>(storeAddress), sizeof(store));
+        return guard == 0x14000082 || (guard == 0x34001040 && store == 0xf900e67f);
+    }
+    return false;
+}
+
 void installRevokeTipHook(const WeChatDylibImage &image) {
 
     const std::string buildVersion = currentBundleBuildVersion();
-    if (const auto *config = revokeHookConfigForBuild(buildVersion.c_str())) {
+    const auto *config = revokeHookConfigForBuild(buildVersion.c_str());
+    const auto *inlineConfig = inlineRevokeHookConfigForBuild(buildVersion.c_str());
+    if (config != nullptr) {
         installRevokeTipStubHook(image, config);
-    } else if (const auto *inlineConfig = inlineRevokeHookConfigForBuild(buildVersion.c_str())) {
+    } else if (inlineConfig != nullptr) {
         installRevokeTipInlineHook(image, inlineConfig);
     }
+
+    WeChatTweakRevokeHookStatus hookStatus = WeChatTweakRevokeHookUnsupported;
+    if (config != nullptr || inlineConfig != nullptr) {
+        hookStatus = activeRevokeHookConfig != nullptr && originalParseRevokeXML != nullptr
+            ? WeChatTweakRevokeHookInstalled : WeChatTweakRevokeHookFailed;
+        if (hookStatus == WeChatTweakRevokeHookFailed && hasStaticRevokePatch(image, buildVersion)) {
+            hookStatus = WeChatTweakRevokeHookStaticPatch;
+        }
+    }
+    wechat_tweak_set_revoke_hook_status(hookStatus);
 
     if (const auto *captureConfig = inlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
         installMessageCaptureInlineHook(image, captureConfig);
@@ -2375,6 +2438,10 @@ int wechat_antirecall_message_capture_inline_hook_selftest(void) {
 
 __attribute__((constructor))
 static void wechat_antirecall_runtime_init() {
+    wechat_tweak_schedule_injection_menu();
+#if !defined(__arm64__)
+    wechat_tweak_set_revoke_hook_status(WeChatTweakRevokeHookUnsupported);
+#endif
     // libwxld can preload this dependency before loading wechat.dylib itself.
     // dyld reports existing and future images synchronously; future callbacks
     // run before initializers, unlike an asynchronous retry of a zero hook slot.

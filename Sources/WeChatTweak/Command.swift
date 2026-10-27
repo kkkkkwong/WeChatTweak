@@ -13,6 +13,7 @@ struct Command {
         case unsupportedArchitecture
         case unsupportedRecallMode
         case missingRuntimeDylib(String)
+        case invalidWeChatApp
 
         var errorDescription: String? {
             switch self {
@@ -25,7 +26,9 @@ struct Command {
             case .unsupportedRecallMode:
                 return "This WeChat build has no verified patch for the selected recall-label mode"
             case let .missingRuntimeDylib(path):
-                return "Custom recall labels need the runtime library at \(path); build it with `swift build --product WeChatTweakRuntime` or pass --runtime-dylib"
+                return "Runtime injection needs the library at \(path); build it with `swift build --product WeChatTweakRuntime` or pass --runtime-dylib"
+            case .invalidWeChatApp:
+                return "Runtime injection requires a WeChat app (com.tencent.xinWeChat) with executable WeChat"
             }
         }
     }
@@ -66,38 +69,65 @@ struct Command {
             }
             return try Patcher.prepare(binary: binary, entries: groups[path]!.flatMap(\.entries))
         }
-        var runtimePlan: DylibInjector.Plan?
-        var runtimeSource: URL?
-        var runtimeDestination: URL?
-        if customRecallLabel {
-            let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
-            let source = runtimeDylib ?? executable
-                .deletingLastPathComponent()
-                .appendingPathComponent("libWeChatTweakRuntime.dylib")
-            guard FileManager.default.isReadableFile(atPath: source.path) else {
-                throw Error.missingRuntimeDylib(source.path)
-            }
-            let binary = root.appendingPathComponent("Contents/Resources/wechat.dylib")
-            runtimePlan = try DylibInjector.prepare(
-                binary: binary,
-                installName: "@loader_path/libWeChatTweakRuntime.dylib"
-            )
-            runtimeSource = source
-            runtimeDestination = root.appendingPathComponent("Contents/Resources/libWeChatTweakRuntime.dylib")
-        }
+        let runtime = customRecallLabel ? try prepareRuntime(app: root, source: runtimeDylib) : nil
         if !dryRun {
-            if let runtimeSource, let runtimeDestination {
-                if FileManager.default.fileExists(atPath: runtimeDestination.path) {
-                    try FileManager.default.removeItem(at: runtimeDestination)
-                }
-                try FileManager.default.copyItem(at: runtimeSource, to: runtimeDestination)
-            }
+            if let runtime { try copyRuntime(runtime) }
             for plan in plans {
                 try Patcher.apply(plan)
             }
-            if let runtimePlan { try DylibInjector.apply(runtimePlan) }
+            if let runtime { try DylibInjector.apply(runtime.plan) }
         }
-        return plans.map(\.binary) + (runtimeDestination.map { [$0] } ?? [])
+        return plans.map(\.binary) + (runtime.map { [$0.destination] } ?? [])
+    }
+
+    @discardableResult
+    static func injectRuntime(app: URL, runtimeDylib: URL? = nil, dryRun: Bool = false) throws -> [URL] {
+        let root = app.resolvingSymlinksInPath().standardizedFileURL
+        let data = try Data(contentsOf: root.appendingPathComponent("Contents/Info.plist"))
+        let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        let identifier = info?["CFBundleIdentifier"] as? String ?? ""
+        guard root.pathExtension == "app",
+              info?["CFBundleExecutable"] as? String == "WeChat",
+              identifier == "com.tencent.xinWeChat" || identifier.hasPrefix("com.tencent.xinWeChat.antirecall.clone") else {
+            throw Error.invalidWeChatApp
+        }
+        let runtime = try prepareRuntime(app: root, source: runtimeDylib)
+        if !dryRun {
+            try copyRuntime(runtime)
+            try DylibInjector.apply(runtime.plan)
+        }
+        return [runtime.plan.binary, runtime.destination]
+    }
+
+    private struct RuntimeInstallation {
+        let source: URL
+        let destination: URL
+        let plan: DylibInjector.Plan
+    }
+
+    private static func prepareRuntime(app: URL, source: URL?) throws -> RuntimeInstallation {
+        let executable = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])
+        let source = (source ?? executable.deletingLastPathComponent().appendingPathComponent("libWeChatTweakRuntime.dylib"))
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard FileManager.default.isReadableFile(atPath: source.path) else {
+            throw Error.missingRuntimeDylib(source.path)
+        }
+        let binary = app.appendingPathComponent("Contents/Resources/wechat.dylib").resolvingSymlinksInPath().standardizedFileURL
+        guard binary.path.hasPrefix(app.path + "/Contents/") else {
+            throw Error.invalidBinaryPath(binary.path)
+        }
+        return RuntimeInstallation(
+            source: source,
+            destination: binary.deletingLastPathComponent().appendingPathComponent("libWeChatTweakRuntime.dylib"),
+            plan: try DylibInjector.prepare(binary: binary, installName: "@loader_path/libWeChatTweakRuntime.dylib")
+        )
+    }
+
+    private static func copyRuntime(_ runtime: RuntimeInstallation) throws {
+        guard runtime.source != runtime.destination else { return }
+        // Replace the library atomically, including an existing symlink, so a
+        // failed copy cannot first delete the previously installed runtime.
+        try Data(contentsOf: runtime.source).write(to: runtime.destination, options: .atomic)
     }
 
     static func resign(app: URL, binaries: [URL]) async throws {
